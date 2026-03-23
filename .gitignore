@@ -1,3 +1,7 @@
-bashecho "venv/" > .gitignore
-echo "__pycache__/" >> .gitignore
-echo "*.pyc" >> .gitignore
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+tracker_log.txt
+tracker_error.txt

@@ -1,280 +1,306 @@
 """
-CREX Fantasy Points Tracker — v2
-==================================
-Scrapes today's IPL match scorecard(s) from crex.com for fantasy points
-and logs them into your players.xlsx with today's date.
+CREX Fantasy Points Tracker — Final Version
+=============================================
+Fetches today's IPL 2026 scorecard from crex.com and calculates
+fantasy points using the standard Dream11/CREX T20 point system.
+Logs results to players.xlsx under today's date column.
 
-STRATEGY: Rather than searching per player (which gets blocked), this script:
-  1. Finds today's IPL matches on CREX
-  2. Scrapes the fantasy points tab of each scorecard
-  3. Matches the points back to your player list
-
-HOW TO RUN:
+HOW TO RUN LOCALLY:
+    source venv/bin/activate
     python3 fantasy_points_tracker.py
 
-REQUIREMENTS (inside your venv):
-    pip install selenium openpyxl webdriver-manager beautifulsoup4 requests
-
-YOUR EXCEL FILE:
-    Sheet name:  Players
-    Column A:    Player Name   (e.g. "Abhishek Sharma")
-    Column B:    Team          (e.g. "SRH") — optional but helps matching
-
-python3 -m venv venv
-
-source venv/bin/activate
-pip install openpyxl selenium webdriver-manager beautifulsoup4 requests
-python3 fantasy_points_tracker.py
-
-
+REQUIREMENTS:
+    pip install requests openpyxl beautifulsoup4
 """
 
-import time
 import re
 import sys
-from datetime import datetime
+import os
+from datetime import datetime, date
 from pathlib import Path
-
-# ─── Dependency checks ───────────────────────────────────────────────────────
-try:
-    from openpyxl import load_workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-except ImportError:
-    sys.exit("pip install openpyxl")
 
 try:
     import requests
     from bs4 import BeautifulSoup
 except ImportError:
-    sys.exit("pip install requests beautifulsoup4")
+    sys.exit("Run: pip install requests beautifulsoup4")
 
 try:
-    from selenium import webdriver
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.common.exceptions import TimeoutException, WebDriverException
+    from openpyxl import load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
 except ImportError:
-    sys.exit("pip install selenium")
+    sys.exit("Run: pip install openpyxl")
 
-try:
-    from webdriver_manager.chrome import ChromeDriverManager
-    from selenium.webdriver.chrome.service import Service
-    HAS_WDM = True
-except ImportError:
-    HAS_WDM = False
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
+EXCEL_FILE     = "players.xlsx"
+DATA_START_ROW = 2
 
-# ─── Config ──────────────────────────────────────────────────────────────────
-EXCEL_FILE      = "players.xlsx"
-DATA_START_ROW  = 2
-HEADLESS        = False   # False = visible browser window (more reliable, bypasses blocks)
-WAIT_SECS       = 4
-IPL_SERIES_ID   = "indian-premier-league-2026-1PW"
-CREX_BASE       = "https://crex.com"
+# IPL 2026 full schedule — date → list of CREX scorecard paths
+# Dates are in IST. Update this dict as more fixtures are announced.
+IPL_SCHEDULE = {
+    "2026-03-28": ["scoreboard/10XZ/1PW/1st-Match/K/L/rcb-vs-srh-1st-match-indian-premier-league-2026"],
+    "2026-03-29": ["scoreboard/10Y0/1PW/2nd-Match/F/J/kkr-vs-mi-2nd-match-indian-premier-league-2026"],
+    "2026-03-30": ["scoreboard/10Y1/1PW/3rd-Match/G/M/csk-vs-rr-3rd-match-indian-premier-league-2026"],
+    "2026-03-31": ["scoreboard/10Y2/1PW/4th-Match/I/KB/gt-vs-pbks-4th-match-indian-premier-league-2026"],
+    "2026-04-01": ["scoreboard/10Y3/1PW/5th-Match/H/KC/dc-vs-lsg-5th-match-indian-premier-league-2026"],
+    "2026-04-02": ["scoreboard/10Y4/1PW/6th-Match/J/L/kkr-vs-srh-6th-match-indian-premier-league-2026"],
+    "2026-04-03": ["scoreboard/10Y5/1PW/7th-Match/G/I/csk-vs-pbks-7th-match-indian-premier-league-2026"],
+    "2026-04-04": [
+        "scoreboard/10Y6/1PW/8th-Match/F/H/dc-vs-mi-8th-match-indian-premier-league-2026",
+        "scoreboard/10Y7/1PW/9th-Match/KB/M/gt-vs-rr-9th-match-indian-premier-league-2026",
+    ],
+    "2026-04-05": [
+        "scoreboard/10Y8/1PW/10th-Match/KC/L/lsg-vs-srh-10th-match-indian-premier-league-2026",
+        "scoreboard/10Y9/1PW/11th-Match/G/K/csk-vs-rcb-11th-match-indian-premier-league-2026",
+    ],
+    "2026-04-06": ["scoreboard/10YA/1PW/12th-Match/I/J/kkr-vs-pbks-12th-match-indian-premier-league-2026"],
+    "2026-04-07": ["scoreboard/10YB/1PW/13th-Match/F/M/mi-vs-rr-13th-match-indian-premier-league-2026"],
+    "2026-04-08": ["scoreboard/10YC/1PW/14th-Match/H/KB/dc-vs-gt-14th-match-indian-premier-league-2026"],
+    "2026-04-09": ["scoreboard/10YD/1PW/15th-Match/J/KC/kkr-vs-lsg-15th-match-indian-premier-league-2026"],
+    "2026-04-10": ["scoreboard/10YE/1PW/16th-Match/K/M/rcb-vs-rr-16th-match-indian-premier-league-2026"],
+    "2026-04-11": [
+        "scoreboard/10YF/1PW/17th-Match/I/L/pbks-vs-srh-17th-match-indian-premier-league-2026",
+        "scoreboard/10YG/1PW/18th-Match/G/H/csk-vs-dc-18th-match-indian-premier-league-2026",
+    ],
+    "2026-04-12": [
+        "scoreboard/10YH/1PW/19th-Match/KB/KC/gt-vs-lsg-19th-match-indian-premier-league-2026",
+        "scoreboard/10YI/1PW/20th-Match/F/K/mi-vs-rcb-20th-match-indian-premier-league-2026",
+    ],
+}
+
+CREX_BASE = "https://crex.com"
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://crex.com/",
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FANTASY POINT SYSTEM  (Standard Dream11 / CREX T20 rules)
+# ─────────────────────────────────────────────────────────────────────────────
+PTS_PLAYING        =  4
+PTS_RUN            =  1
+PTS_BOUNDARY       =  1
+PTS_SIX            =  2
+PTS_FIFTY          =  8
+PTS_CENTURY        = 16
+PTS_DUCK           = -2
+SR_BONUS_170       =  6
+SR_BONUS_150       =  4
+SR_BONUS_130       =  2
+SR_PENALTY_60      = -2
+SR_PENALTY_50      = -4
+SR_PENALTY_40      = -6
+PTS_WICKET         = 25
+PTS_LBW_BOWLED     =  8
+PTS_3WICKETS       =  4
+PTS_4WICKETS       =  8
+PTS_5WICKETS       = 16
+PTS_MAIDEN         = 12
+ER_BONUS_4         =  6
+ER_BONUS_5         =  4
+ER_BONUS_7         =  2
+ER_PENALTY_12      = -2
+ER_PENALTY_13      = -4
+ER_PENALTY_14      = -6
+PTS_CATCH          =  8
+PTS_STUMPING       = 12
+PTS_RUN_OUT_DIRECT = 12
+
+
+def calc_batting_pts(runs, balls, fours, sixes, dismissed, role):
+    if balls == 0 and runs == 0:
+        return 0
+    pts  = runs * PTS_RUN
+    pts += fours * PTS_BOUNDARY
+    pts += sixes * PTS_SIX
+    if runs >= 100:
+        pts += PTS_CENTURY
+    elif runs >= 50:
+        pts += PTS_FIFTY
+    if dismissed and runs == 0 and role.lower() != "bowler":
+        pts += PTS_DUCK
+    if balls >= 10:
+        sr = (runs / balls) * 100
+        if   sr >= 170: pts += SR_BONUS_170
+        elif sr >= 150: pts += SR_BONUS_150
+        elif sr >= 130: pts += SR_BONUS_130
+        elif sr <   40: pts += SR_PENALTY_40
+        elif sr <   50: pts += SR_PENALTY_50
+        elif sr <   60: pts += SR_PENALTY_60
+    return pts
+
+
+def calc_bowling_pts(wickets, lbw_bowled, overs, maidens, runs_given):
+    if overs == 0:
+        return 0
+    pts  = wickets * PTS_WICKET
+    pts += lbw_bowled * PTS_LBW_BOWLED
+    pts += maidens * PTS_MAIDEN
+    if   wickets >= 5: pts += PTS_5WICKETS
+    elif wickets >= 4: pts += PTS_4WICKETS
+    elif wickets >= 3: pts += PTS_3WICKETS
+    if overs >= 2:
+        er = runs_given / overs
+        if   er <  4: pts += ER_BONUS_4
+        elif er <  5: pts += ER_BONUS_5
+        elif er <  7: pts += ER_BONUS_7
+        elif er > 14: pts += ER_PENALTY_14
+        elif er > 13: pts += ER_PENALTY_13
+        elif er > 12: pts += ER_PENALTY_12
+    return pts
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SCORECARD SCRAPING
 # ─────────────────────────────────────────────────────────────────────────────
 
-
-def make_driver():
-    opts = Options()
-    if HEADLESS:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--window-size=1280,900")
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    )
-    opts.add_argument("--ignore-certificate-errors")
-    opts.add_argument("--ignore-ssl-errors")
-
-    if HAS_WDM:
-        svc = Service(ChromeDriverManager().install())
-        d = webdriver.Chrome(service=svc, options=opts)
-    else:
-        d = webdriver.Chrome(options=opts)
-
-    d.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-        "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    })
-    return d
+def _blank():
+    return {
+        "runs": 0, "balls": 0, "fours": 0, "sixes": 0,
+        "dismissed": False, "batted": False,
+        "wickets": 0, "overs": 0.0, "maidens": 0,
+        "runs_given": 0, "lbw_bowled": 0, "bowled": False,
+        "catches": 0, "stumpings": 0, "run_outs": 0,
+        "role": "batsman",
+    }
 
 
-def get_todays_match_urls(driver):
-    url = f"{CREX_BASE}/series/{IPL_SERIES_ID}/matches"
-    print(f"  Opening: {url}")
-    driver.get(url)
-    time.sleep(WAIT_SECS)
-
-    soup = BeautifulSoup(driver.page_source, "html.parser")
-    today = datetime.today()
-    # Multiple date format variants to match against page text
-    date_variants = [
-        today.strftime("%-d %b").lower(),   # "22 mar"
-        today.strftime("%b %-d").lower(),   # "mar 22"
-        today.strftime("%d %b").lower(),    # "22 mar" (zero-padded)
-        today.strftime("%B %-d").lower(),   # "march 22"
-    ]
-
-    match_urls = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/scoreboard/" not in href and "scorecard" not in href:
-            continue
-        card = a.find_parent(class_=re.compile(r"match|card|fixture|row", re.I)) or a
-        parent_text = card.get_text(separator=" ", strip=True).lower()
-        if any(dv in parent_text for dv in date_variants):
-            full = href if href.startswith("http") else CREX_BASE + href
-            if full not in match_urls:
-                match_urls.append(full)
-
-    # Fallback: grab up to 2 most recent scorecard links
-    if not match_urls:
-        print("  Could not detect today by date — grabbing latest match links.")
-        seen = []
-        for a in soup.find_all("a", href=True):
-            href = a["href"]
-            if "/scoreboard/" in href or "scorecard" in href:
-                full = href if href.startswith("http") else CREX_BASE + href
-                if full not in seen:
-                    seen.append(full)
-        match_urls = seen[:2]
-
-    return match_urls
-
-
-def scrape_fantasy_points_from_scorecard(driver, scorecard_url):
-    base_url = scorecard_url.split("?")[0].rstrip("/")
-    if not base_url.endswith("/scorecard"):
-        base_url = base_url + "/scorecard"
-
-    print(f"  Loading: {base_url}")
-    driver.get(base_url)
-    time.sleep(WAIT_SECS)
-
-    # Try clicking the Fantasy tab
+def fetch_scorecard(path: str) -> dict:
+    url = f"{CREX_BASE}/{path}/scorecard"
+    print(f"  Fetching: {url}")
     try:
-        tabs = driver.find_elements(
-            By.XPATH,
-            "//*[(self::a or self::button or self::span or self::li or self::div) "
-            "and contains(translate(normalize-space(text()),'ABCDEFGHIJKLMNOPQRSTUVWXYZ',"
-            "'abcdefghijklmnopqrstuvwxyz'),'fantasy')]"
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"  ⚠ Could not fetch scorecard: {e}")
+        return {}
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    players = {}
+
+    # Parse batting rows: Name | How Out | R | B | 4s | 6s | SR
+    for row in soup.select("table tr, .batting-row, [class*='bat']"):
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if len(cells) < 6:
+            continue
+        try:
+            runs  = int(cells[2])
+            balls = int(cells[3])
+            fours = int(cells[4])
+            sixes = int(cells[5])
+        except (ValueError, IndexError):
+            continue
+        name    = cells[0].strip()
+        how_out = cells[1].strip().lower() if len(cells) > 1 else ""
+        dismissed = how_out not in ("not out", "dnb", "")
+        if name and len(name) > 3 and not name.lower().startswith("extra"):
+            if name not in players:
+                players[name] = _blank()
+            players[name].update({
+                "runs": runs, "balls": balls,
+                "fours": fours, "sixes": sixes,
+                "dismissed": dismissed, "batted": True,
+            })
+
+    # Parse bowling rows: Name | O | M | R | W | Econ
+    for row in soup.select("table tr, .bowling-row, [class*='bowl']"):
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if len(cells) < 5:
+            continue
+        try:
+            overs   = float(cells[1])
+            maidens = int(cells[2])
+            runs_g  = int(cells[3])
+            wickets = int(cells[4])
+        except (ValueError, IndexError):
+            continue
+        name = cells[0].strip()
+        if name and len(name) > 3:
+            if name not in players:
+                players[name] = _blank()
+            players[name].update({
+                "overs": overs, "maidens": maidens,
+                "runs_given": runs_g, "wickets": wickets,
+                "bowled": True,
+            })
+
+    return players
+
+
+def compute_fantasy_points(players: dict) -> dict:
+    result = {}
+    for name, p in players.items():
+        pts  = PTS_PLAYING
+        pts += calc_batting_pts(
+            p["runs"], p["balls"], p["fours"], p["sixes"],
+            p["dismissed"], p.get("role", "batsman")
         )
-        for tab in tabs:
-            try:
-                if tab.is_displayed():
-                    driver.execute_script("arguments[0].click();", tab)
-                    time.sleep(WAIT_SECS)
-                    break
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    points = _parse_page(driver.page_source)
-
-    # Try /fantasy URL if tab parsing got nothing
-    if not points:
-        fantasy_url = base_url.replace("/scorecard", "/fantasy")
-        print(f"  Trying: {fantasy_url}")
-        driver.get(fantasy_url)
-        time.sleep(WAIT_SECS)
-        points = _parse_page(driver.page_source)
-
-    return points
+        pts += calc_bowling_pts(
+            p["wickets"], p.get("lbw_bowled", 0),
+            p["overs"], p["maidens"], p["runs_given"]
+        )
+        pts += p["catches"]   * PTS_CATCH
+        pts += p["stumpings"] * PTS_STUMPING
+        pts += p["run_outs"]  * PTS_RUN_OUT_DIRECT
+        result[name] = round(pts, 1)
+    return result
 
 
-def _parse_page(html):
-    soup = BeautifulSoup(html, "html.parser")
-    points = {}
+# ─────────────────────────────────────────────────────────────────────────────
+# PLAYER MATCHING
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Walk every row-like element, look for name + number pairs
-    for row in soup.find_all(["tr", "div", "li", "section"]):
-        parts = [p.strip() for p in row.get_text(separator="|", strip=True).split("|") if p.strip()]
-        nums = [(i, float(p)) for i, p in enumerate(parts) if re.match(r'^\d+(\.\d+)?$', p) and float(p) >= 2]
-        names = [(i, p) for i, p in enumerate(parts) if _is_name(p)]
-        if nums and names:
-            n_idx, name = names[0]
-            p_idx, pts = nums[0]
-            # Ensure name and number are adjacent-ish
-            if abs(n_idx - p_idx) <= 4:
-                points[name] = pts
-
-    # Fallback: regex scan entire text for "Name ... XX.X pts" patterns
-    if not points:
-        text = soup.get_text(separator=" ")
-        # Pattern: capitalized words followed by a number
-        for m in re.finditer(r'([A-Z][a-z]+(?: [A-Z][a-z]+){1,3})\s+(\d+\.?\d*)', text):
-            name, pts = m.group(1), float(m.group(2))
-            if _is_name(name) and pts >= 2:
-                points[name] = pts
-
-    return points
-
-
-def _is_name(text):
-    if not text or len(text) < 5 or len(text) > 40:
-        return False
-    if re.match(r'^\d+(\.\d+)?$', text):
-        return False
-    if not re.search(r'[A-Za-z]{2,}', text):
-        return False
-    bad = {"batting", "bowling", "player", "team", "runs", "wkts", "over",
-           "points", "fantasy", "economy", "strike", "average", "total",
-           "wicket", "innings", "catch", "stumping", "direct"}
-    return text.lower().strip() not in bad
-
-
-def normalize(name):
+def normalize(name: str) -> str:
     return re.sub(r'\s+', ' ', re.sub(r'[^a-z\s]', '', name.lower())).strip()
 
 
-def match_players(your_players, scraped_points):
-    results = {}
+def match_players(your_players, scraped_points) -> dict:
     scraped_norm = {normalize(k): v for k, v in scraped_points.items()}
-
+    results = {}
     for player in your_players:
-        name = player["name"]
-        norm = normalize(name)
+        name  = player["name"]
+        norm  = normalize(name)
         parts = norm.split()
-        pts = None
-
-        # 1. Exact
+        pts   = None
+        # 1. Exact match
         if norm in scraped_norm:
             pts = scraped_norm[norm]
-        # 2. Last name match
-        elif parts:
-            last = parts[-1]
+        else:
+            # 2. Last name
             for sn, sv in scraped_norm.items():
-                if last in sn.split():
-                    pts = sv
-                    break
-        # 3. First name match
-        if pts is None and len(parts) > 1:
-            first = parts[0]
-            for sn, sv in scraped_norm.items():
-                if sn.split() and sn.split()[0] == first:
-                    pts = sv
-                    break
-
+                if parts and parts[-1] in sn.split():
+                    pts = sv; break
+            # 3. First name
+            if pts is None and len(parts) > 1:
+                for sn, sv in scraped_norm.items():
+                    snp = sn.split()
+                    if snp and snp[0] == parts[0]:
+                        pts = sv; break
         results[name] = str(pts) if pts is not None else "No match today"
-
     return results
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EXCEL I/O
+# ─────────────────────────────────────────────────────────────────────────────
 
 def load_players(wb):
     ws = wb["Players"]
     players = []
     for row in ws.iter_rows(min_row=DATA_START_ROW, values_only=True):
-        name = row[0]
-        if not name:
+        if not row[0]:
             continue
-        team = row[1] if len(row) > 1 else ""
-        players.append({"name": str(name).strip(), "team": str(team).strip() if team else ""})
+        players.append({
+            "name": str(row[0]).strip(),
+            "team": str(row[1]).strip() if len(row) > 1 and row[1] else "",
+        })
     return players
 
 
@@ -283,8 +309,8 @@ def get_or_create_date_col(ws, today_str):
         cell = ws.cell(row=1, column=col)
         if cell.value is None:
             cell.value = today_str
-            cell.font = Font(bold=True, color="FFFFFF", name="Arial")
-            cell.fill = PatternFill("solid", start_color="1F4E79")
+            cell.font      = Font(bold=True, color="FFFFFF", name="Arial")
+            cell.fill      = PatternFill("solid", start_color="1F4E79")
             cell.alignment = Alignment(horizontal="center")
             ws.column_dimensions[cell.column_letter].width = 14
             return col
@@ -295,86 +321,87 @@ def get_or_create_date_col(ws, today_str):
 
 def write_results(ws, players, results, date_col):
     for row_idx, player in enumerate(players, start=DATA_START_ROW):
-        val = results.get(player["name"], "N/A")
+        val  = results.get(player["name"], "N/A")
         cell = ws.cell(row=row_idx, column=date_col, value=val)
         cell.alignment = Alignment(horizontal="center")
-        cell.font = Font(name="Arial", size=10)
+        cell.font      = Font(name="Arial", size=10)
         try:
             float(val)
             cell.fill = PatternFill("solid", start_color="E2EFDA")
-            cell.font = Font(color="375623", name="Arial", size=10)
+            cell.font = Font(color="375623", name="Arial", size=10, bold=True)
         except ValueError:
-            if val == "No match today":
-                cell.fill = PatternFill("solid", start_color="F2F2F2")
-            else:
-                cell.fill = PatternFill("solid", start_color="FCE4D6")
+            cell.fill = PatternFill("solid", start_color="F2F2F2")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
+    # GitHub Actions runs in UTC; IST = UTC+5:30
+    # We use IST date to match the schedule correctly
+    from datetime import timezone, timedelta
+    IST = timezone(timedelta(hours=5, minutes=30))
+    now_ist   = datetime.now(IST)
+    today_key = now_ist.strftime("%Y-%m-%d")
+    today_str = now_ist.strftime("%d-%b-%Y")
+
+    print(f"\n🏏  CREX Fantasy Points Tracker  —  {today_str} (IST)")
+    print("=" * 52)
+
     excel_path = Path(EXCEL_FILE)
     if not excel_path.exists():
-        sys.exit(f"'{EXCEL_FILE}' not found. Put it in the same folder as this script.")
-
-    today_str = datetime.today().strftime("%d-%b-%Y")
-    print(f"\nCREX Fantasy Points Tracker  —  {today_str}")
-    print("=" * 52)
+        sys.exit(f"❌  '{EXCEL_FILE}' not found.")
 
     wb = load_workbook(excel_path)
     if "Players" not in wb.sheetnames:
-        sys.exit("No sheet named 'Players' found.")
+        sys.exit("❌  No sheet named 'Players' found.")
 
     players = load_players(wb)
-    if not players:
-        sys.exit("No players found. Names go from row 2 in Column A.")
+    print(f"📋  {len(players)} players loaded.\n")
 
-    print(f"{len(players)} players loaded.\n")
+    match_paths = IPL_SCHEDULE.get(today_key, [])
+    if not match_paths:
+        print(f"📅  No IPL match scheduled today ({today_str}). Saving 'No match today'.")
+        results = {p["name"]: "No match today" for p in players}
+    else:
+        print(f"📅  {len(match_paths)} match(es) today. Fetching scorecards...\n")
+        all_raw = {}
+        for path in match_paths:
+            raw = fetch_scorecard(path)
+            print(f"     → {len(raw)} players parsed.")
+            all_raw.update(raw)
 
-    print(f"Launching Chrome (visible window — do not close it)...")
-    try:
-        driver = make_driver()
-    except WebDriverException as e:
-        sys.exit(f"Chrome failed: {e}")
-
-    all_points = {}
-    try:
-        print("Finding today's IPL matches...")
-        match_urls = get_todays_match_urls(driver)
-
-        if not match_urls:
-            print("No matches found for today.")
+        if not all_raw:
+            print("\n  ⚠ Scorecard not yet available (match may not have finished).")
+            results = {p["name"]: "Scorecard unavailable" for p in players}
         else:
-            print(f"Found {len(match_urls)} match(es):")
-            for u in match_urls:
-                print(f"  {u}")
-            print()
+            print(f"\n📊  Computing fantasy points...")
+            fantasy_pts = compute_fantasy_points(all_raw)
 
-        for url in match_urls:
-            print(f"\nScraping: {url}")
-            pts = scrape_fantasy_points_from_scorecard(driver, url)
-            print(f"  {len(pts)} player-points found.")
-            all_points.update(pts)
+            print("\n  All scraped players:")
+            for pname, pts in sorted(fantasy_pts.items(), key=lambda x: -x[1]):
+                print(f"    {pname}: {pts}")
 
-    finally:
-        driver.quit()
+            print(f"\n🔗  Matching to your {len(players)} players...")
+            results = match_players(players, fantasy_pts)
 
-    print(f"\nMatching players...")
-    results = match_players(players, all_points)
     found = 0
+    print()
     for name, pts in results.items():
-        has_pts = pts not in ("N/A", "No match today")
-        if has_pts:
-            found += 1
-        icon = "✅" if has_pts else "—"
-        print(f"  {icon}  {name}: {pts}")
+        has  = pts not in ("N/A", "No match today", "Scorecard unavailable")
+        found += has
+        print(f"  {'✅' if has else '—'}  {name}: {pts}")
 
     ws = wb["Players"]
     date_col = get_or_create_date_col(ws, today_str)
     write_results(ws, players, results, date_col)
     wb.save(excel_path)
 
-    print(f"\nDone! {found}/{len(players)} players had points today.")
-    print(f"Saved to '{EXCEL_FILE}' under column '{today_str}'\n")
+    print(f"\n✅  Done! {found}/{len(players)} players matched.")
+    print(f"💾  Saved → '{EXCEL_FILE}'  column '{today_str}'\n")
 
 
 if __name__ == "__main__":
     main()
+    
